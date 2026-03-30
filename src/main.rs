@@ -1,4 +1,4 @@
-//! ML-DSA-65 key management utility for ant-node release signing.
+//! ML-DSA-65 key management utility for Autonomi release signing.
 //!
 //! This utility provides:
 //! - Keypair generation for release signing
@@ -25,12 +25,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process;
 
-/// Signing context for domain separation (prevents cross-protocol attacks).
-const SIGNING_CONTEXT: &[u8] = b"ant-node-release-v1";
+/// Default signing context for domain separation (prevents cross-protocol attacks).
+const DEFAULT_SIGNING_CONTEXT: &str = "ant-node-release-v1";
 
 #[derive(Parser)]
 #[command(name = "ant-keygen")]
-#[command(about = "ML-DSA-65 key management for ant-node releases")]
+#[command(about = "ML-DSA-65 key management for Autonomi releases")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -56,6 +56,9 @@ enum Commands {
         /// Path to write the signature
         #[arg(short, long)]
         output: PathBuf,
+        /// Signing context for domain separation
+        #[arg(short, long, default_value = DEFAULT_SIGNING_CONTEXT)]
+        context: String,
     },
     /// Verify a signature
     Verify {
@@ -68,12 +71,18 @@ enum Commands {
         /// Path to the signature file
         #[arg(short, long)]
         signature: PathBuf,
+        /// Signing context for domain separation (must match the context used during signing)
+        #[arg(long, default_value = DEFAULT_SIGNING_CONTEXT)]
+        context: String,
     },
     /// Validate a hex-encoded secret key (for CI secret verification)
     VerifyKey {
         /// Hex-encoded secret key string (reads from stdin if not provided)
         #[arg(short = 'x', long)]
         hex: Option<String>,
+        /// Signing context used for the test signature
+        #[arg(long, default_value = DEFAULT_SIGNING_CONTEXT)]
+        context: String,
     },
 }
 
@@ -82,18 +91,24 @@ fn main() {
 
     match cli.command {
         Commands::Generate { output_dir } => generate_keypair(&output_dir),
-        Commands::Sign { key, input, output } => sign_file(&key, &input, &output),
+        Commands::Sign {
+            key,
+            input,
+            output,
+            context,
+        } => sign_file(&key, &input, &output, &context),
         Commands::Verify {
             key,
             input,
             signature,
-        } => verify_signature(&key, &input, &signature),
-        Commands::VerifyKey { hex } => verify_hex_key(hex),
+            context,
+        } => verify_signature(&key, &input, &signature, &context),
+        Commands::VerifyKey { hex, context } => verify_hex_key(hex, &context),
     }
 }
 
 fn generate_keypair(output_dir: &PathBuf) {
-    println!("ML-DSA-65 Keypair Generator for ant-node releases\n");
+    println!("ML-DSA-65 Keypair Generator\n");
 
     // Create output directory if it doesn't exist
     fs::create_dir_all(output_dir).expect("Failed to create output directory");
@@ -172,7 +187,7 @@ fn generate_keypair(output_dir: &PathBuf) {
     println!("Rust embed code saved to: {}", rust_code_path.display());
 
     // Also print to stdout for convenience
-    println!("\n--- Rust code for signature.rs ---\n");
+    println!("\n--- Rust code for embedding ---\n");
     println!("const RELEASE_SIGNING_KEY: &[u8] = &[");
     for (i, byte) in pk_bytes.iter().enumerate() {
         if i % 16 == 0 {
@@ -191,10 +206,9 @@ fn generate_keypair(output_dir: &PathBuf) {
     println!("];");
 
     println!("\n--- End of Rust code ---");
-    println!("\nDone! Copy the above code to src/upgrade/signature.rs");
 }
 
-fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf) {
+fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf, context: &str) {
     println!("Signing {} with ML-DSA-65...", input_path.display());
 
     // Load secret key
@@ -210,7 +224,7 @@ fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf) {
     // Create DSA instance and sign with context
     let dsa = ml_dsa_65();
     let signature = dsa
-        .sign_with_context(&secret_key, &data, SIGNING_CONTEXT)
+        .sign_with_context(&secret_key, &data, context.as_bytes())
         .expect("Failed to create signature");
 
     let sig_bytes = signature.to_bytes();
@@ -220,9 +234,10 @@ fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf) {
 
     println!("Signature written to: {}", output_path.display());
     println!("  Signature size: {} bytes", sig_bytes.len());
+    println!("  Context: {context}");
 }
 
-fn verify_hex_key(hex_input: Option<String>) {
+fn verify_hex_key(hex_input: Option<String>, context: &str) {
     println!("Validating hex-encoded ML-DSA-65 secret key...\n");
 
     let hex_str = hex_input.unwrap_or_else(|| {
@@ -267,8 +282,8 @@ fn verify_hex_key(hex_input: Option<String>) {
 
             // Test-sign something to confirm it's functional
             let dsa = ml_dsa_65();
-            let test_data = b"ant-node-key-validation-test";
-            match dsa.sign_with_context(&secret_key, test_data, SIGNING_CONTEXT) {
+            let test_data = b"ant-keygen-key-validation-test";
+            match dsa.sign_with_context(&secret_key, test_data, context.as_bytes()) {
                 Ok(_) => println!("Test signature created successfully."),
                 Err(e) => {
                     eprintln!("\nERROR: Key parsed but signing failed: {e}");
@@ -276,7 +291,7 @@ fn verify_hex_key(hex_input: Option<String>) {
                 }
             }
 
-            println!("\nKey is VALID and ready for use as ANT_NODE_SIGNING_KEY.");
+            println!("\nKey is VALID and ready for use.");
         }
         Err(e) => {
             eprintln!("\nERROR: Failed to parse secret key: {e}");
@@ -285,7 +300,7 @@ fn verify_hex_key(hex_input: Option<String>) {
     }
 }
 
-fn verify_signature(key_path: &PathBuf, input_path: &PathBuf, sig_path: &PathBuf) {
+fn verify_signature(key_path: &PathBuf, input_path: &PathBuf, sig_path: &PathBuf, context: &str) {
     println!("Verifying signature for {}...", input_path.display());
 
     // Load public key
@@ -307,7 +322,7 @@ fn verify_signature(key_path: &PathBuf, input_path: &PathBuf, sig_path: &PathBuf
 
     // Create DSA instance and verify with context
     let dsa = ml_dsa_65();
-    match dsa.verify_with_context(&public_key, &data, &signature, SIGNING_CONTEXT) {
+    match dsa.verify_with_context(&public_key, &data, &signature, context.as_bytes()) {
         Ok(true) => {
             println!("Signature is VALID");
         }

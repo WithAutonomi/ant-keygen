@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.friendly_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            binary: ant-keygen
+            archive: tar.gz
+            friendly_name: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            binary: ant-keygen
+            archive: tar.gz
+            cross: true
+            friendly_name: linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: ant-keygen
+            archive: tar.gz
+            friendly_name: macos-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: ant-keygen
+            archive: tar.gz
+            friendly_name: macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: ant-keygen.exe
+            archive: zip
+            friendly_name: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux ARM64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../ant-keygen-${{ matrix.friendly_name }}.tar.gz ${{ matrix.binary }}
+          cd ../../..
+
+      - name: Create archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Push-Location "target/${{ matrix.target }}/release"
+          Compress-Archive -Path "${{ matrix.binary }}" -DestinationPath "../../../ant-keygen-${{ matrix.friendly_name }}.zip"
+          Pop-Location
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ant-keygen-${{ matrix.friendly_name }}
+          path: ant-keygen-${{ matrix.friendly_name }}.${{ matrix.archive }}
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum ant-keygen-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ant-keygen ${{ github.ref_name }}
+          body: |
+            ## ant-keygen ${{ github.ref_name }}
+
+            ML-DSA-65 (FIPS 204) key management utility for Autonomi release signing.
+
+            ### Downloads
+
+            | Platform | Download |
+            |----------|----------|
+            | Linux x64 | `ant-keygen-linux-x64.tar.gz` |
+            | Linux ARM64 | `ant-keygen-linux-arm64.tar.gz` |
+            | macOS x64 | `ant-keygen-macos-x64.tar.gz` |
+            | macOS ARM64 (Apple Silicon) | `ant-keygen-macos-arm64.tar.gz` |
+            | Windows x64 | `ant-keygen-windows-x64.zip` |
+
+            SHA256 checksums provided in `SHA256SUMS.txt`.
+          files: |
+            artifacts/ant-keygen-*.tar.gz
+            artifacts/ant-keygen-*.zip
+            artifacts/SHA256SUMS.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
