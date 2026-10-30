@@ -4,6 +4,7 @@
 //! - Keypair generation for release signing
 //! - Binary signing with ML-DSA-65
 //! - Signature verification
+//! - Checking that a secret key (e.g. a CI secret) matches the expected public key
 //!
 //! # Usage
 //!
@@ -11,22 +12,35 @@
 //! ant-keygen generate [output-dir]    Generate a new keypair
 //! ant-keygen sign --key <key> --input <file> --output <sig>
 //! ant-keygen verify --key <key> --input <file> --signature <sig>
+//! ant-keygen verify-key --public-key <key.pub> [--hex <hex>]
 //! ```
-
-// This is a standalone CLI tool that exits on any error, so expect/unwrap is acceptable
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//!
+//! Every command exits with code 0 on success and 1 on any failure.
 
 use clap::{Parser, Subcommand};
 use saorsa_pqc::api::sig::{
     ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, MlDsaVariant,
 };
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
+use std::io::Write as _;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
 /// Default signing context for domain separation (prevents cross-protocol attacks).
 const DEFAULT_SIGNING_CONTEXT: &str = "ant-node-release-v1";
+
+/// ML-DSA-65 sizes (FIPS 204).
+const SECRET_KEY_SIZE: usize = 4032;
+const PUBLIC_KEY_SIZE: usize = 1952;
+
+const SECRET_KEY_FILE: &str = "release-signing-key.secret";
+const PUBLIC_KEY_FILE: &str = "release-signing-key.pub";
+const EMBED_FILE: &str = "release_key_embed.rs";
+
+/// Message signed by the self-checks in `generate` and `verify-key`.
+const SELF_CHECK_MESSAGE: &[u8] = b"ant-keygen-key-validation-test";
 
 #[derive(Parser)]
 #[command(name = "ant-keygen")]
@@ -39,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate a new ML-DSA-65 keypair
+    /// Generate a new ML-DSA-65 keypair (refuses to overwrite existing key files)
     Generate {
         /// Output directory for keys
         #[arg(default_value = ".")]
@@ -75,21 +89,46 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_SIGNING_CONTEXT)]
         context: String,
     },
-    /// Validate a hex-encoded secret key (for CI secret verification)
+    /// Check that a hex-encoded secret key (e.g. a CI secret) matches the expected public key
     VerifyKey {
         /// Hex-encoded secret key string (reads from stdin if not provided)
         #[arg(short = 'x', long)]
         hex: Option<String>,
+        /// Path to the public key the secret key must belong to
+        #[arg(short = 'p', long)]
+        public_key: PathBuf,
         /// Signing context used for the test signature
         #[arg(long, default_value = DEFAULT_SIGNING_CONTEXT)]
         context: String,
     },
 }
 
+/// Stack for the thread that runs the command. ML-DSA keeps large arrays on the stack,
+/// and unoptimised builds overflow the 1 MiB main-thread stack Windows gives a process.
+/// 8 MiB is what Linux gives the main thread.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(move || run(cli.command))
+        .map_err(|e| format!("failed to start the worker thread: {e}"))
+        .and_then(|worker| {
+            worker
+                .join()
+                .unwrap_or_else(|_| Err("the worker thread panicked".to_string()))
+        });
+
+    if let Err(e) = result {
+        eprintln!("ERROR: {e}");
+        process::exit(1);
+    }
+}
+
+fn run(command: Commands) -> Result<(), String> {
+    match command {
         Commands::Generate { output_dir } => generate_keypair(&output_dir),
         Commands::Sign {
             key,
@@ -103,236 +142,273 @@ fn main() {
             signature,
             context,
         } => verify_signature(&key, &input, &signature, &context),
-        Commands::VerifyKey { hex, context } => verify_hex_key(hex, &context),
+        Commands::VerifyKey {
+            hex,
+            public_key,
+            context,
+        } => verify_hex_key(hex, &public_key, &context),
     }
 }
 
-fn generate_keypair(output_dir: &PathBuf) {
+fn read_file(path: &Path, what: &str) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| format!("failed to read {what} {}: {e}", path.display()))
+}
+
+fn load_public_key(path: &Path) -> Result<MlDsaPublicKey, String> {
+    let bytes = read_file(path, "public key")?;
+    if bytes.len() != PUBLIC_KEY_SIZE {
+        return Err(format!(
+            "public key {} is {} bytes, expected {PUBLIC_KEY_SIZE}",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    MlDsaPublicKey::from_bytes(MlDsaVariant::MlDsa65, &bytes)
+        .map_err(|e| format!("failed to parse public key {}: {e}", path.display()))
+}
+
+/// Signs [`SELF_CHECK_MESSAGE`] with `secret_key` and verifies it against `public_key`.
+fn keys_match(
+    secret_key: &MlDsaSecretKey,
+    public_key: &MlDsaPublicKey,
+    context: &str,
+) -> Result<bool, String> {
+    let dsa = ml_dsa_65();
+    let signature = dsa
+        .sign_with_context(secret_key, SELF_CHECK_MESSAGE, context.as_bytes())
+        .map_err(|e| format!("signing failed: {e}"))?;
+    dsa.verify_with_context(
+        public_key,
+        SELF_CHECK_MESSAGE,
+        &signature,
+        context.as_bytes(),
+    )
+    .map_err(|e| format!("verification failed: {e}"))
+}
+
+/// Creates `path` and writes `bytes` to it. Fails if the file already exists. With
+/// `private`, the file is created readable and writable by the owner only (Unix).
+fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn generate_keypair(output_dir: &Path) -> Result<(), String> {
     println!("ML-DSA-65 Keypair Generator\n");
 
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir).expect("Failed to create output directory");
+    let sk_path = output_dir.join(SECRET_KEY_FILE);
+    let pk_path = output_dir.join(PUBLIC_KEY_FILE);
+    let rust_code_path = output_dir.join(EMBED_FILE);
+
+    // Never overwrite: replacing a release key by accident can't be undone.
+    for path in [&sk_path, &pk_path, &rust_code_path] {
+        if path.exists() {
+            return Err(format!(
+                "{} already exists; refusing to overwrite it. Move the existing keys away first.",
+                path.display()
+            ));
+        }
+    }
+
+    fs::create_dir_all(output_dir).map_err(|e| {
+        format!(
+            "failed to create output directory {}: {e}",
+            output_dir.display()
+        )
+    })?;
 
     println!("Generating ML-DSA-65 keypair...");
 
-    // Generate keypair
     let dsa = ml_dsa_65();
-    let (public_key, secret_key) = dsa.generate_keypair().expect("Failed to generate keypair");
+    let (public_key, secret_key) = dsa
+        .generate_keypair()
+        .map_err(|e| format!("failed to generate keypair: {e}"))?;
+
+    if !keys_match(&secret_key, &public_key, DEFAULT_SIGNING_CONTEXT)? {
+        return Err("the generated keypair failed its sign/verify self-check".to_string());
+    }
 
     let pk_bytes = public_key.to_bytes();
     let sk_bytes = secret_key.to_bytes();
 
     println!("  Public key size: {} bytes", pk_bytes.len());
     println!("  Secret key size: {} bytes", sk_bytes.len());
+    println!("  Sign/verify self-check passed.");
 
     // Save secret key to file (KEEP THIS SECURE!)
-    let sk_path = output_dir.join("release-signing-key.secret");
-    fs::write(&sk_path, sk_bytes).expect("Failed to write secret key");
+    write_new_file(&sk_path, &sk_bytes, true)?;
     println!("\nSecret key saved to: {}", sk_path.display());
     println!("  WARNING: Keep this file secure! It's needed for signing releases.");
 
-    // Save public key to file
-    let pk_path = output_dir.join("release-signing-key.pub");
-    fs::write(&pk_path, &pk_bytes).expect("Failed to write public key");
+    write_new_file(&pk_path, &pk_bytes, false)?;
     println!("Public key saved to: {}", pk_path.display());
 
-    // Generate Rust code for embedding
-    let rust_code_path = output_dir.join("release_key_embed.rs");
-    let mut rust_file = fs::File::create(&rust_code_path).expect("Failed to create Rust file");
-
-    writeln!(
-        rust_file,
-        "/// Embedded release signing public key (ML-DSA-65)."
-    )
-    .unwrap();
-    writeln!(rust_file, "///").unwrap();
-    writeln!(
-        rust_file,
-        "/// This key is used to verify signatures on released binaries."
-    )
-    .unwrap();
-    writeln!(
-        rust_file,
-        "/// The corresponding private key is held by authorized release signers."
-    )
-    .unwrap();
-    writeln!(
-        rust_file,
-        "/// Generated: {}",
+    let key_array = rust_byte_array(&pk_bytes);
+    let rust_code = format!(
+        "/// Embedded release signing public key (ML-DSA-65).\n\
+         ///\n\
+         /// This key is used to verify signatures on released binaries.\n\
+         /// The corresponding private key is held by authorized release signers.\n\
+         /// Generated: {}\n\
+         const RELEASE_SIGNING_KEY: &[u8] = &[\n{key_array}];\n",
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    )
-    .unwrap();
-    writeln!(rust_file, "const RELEASE_SIGNING_KEY: &[u8] = &[").unwrap();
-
-    // Write bytes in rows of 16 for readability
-    for (i, byte) in pk_bytes.iter().enumerate() {
-        if i % 16 == 0 {
-            write!(rust_file, "    ").unwrap();
-        }
-        write!(rust_file, "0x{byte:02x},").unwrap();
-        if i % 16 == 15 {
-            writeln!(rust_file).unwrap();
-        } else {
-            write!(rust_file, " ").unwrap();
-        }
-    }
-
-    // Handle last line if not complete
-    if pk_bytes.len() % 16 != 0 {
-        writeln!(rust_file).unwrap();
-    }
-
-    writeln!(rust_file, "];").unwrap();
-
+    );
+    write_new_file(&rust_code_path, rust_code.as_bytes(), false)?;
     println!("Rust embed code saved to: {}", rust_code_path.display());
 
     // Also print to stdout for convenience
     println!("\n--- Rust code for embedding ---\n");
-    println!("const RELEASE_SIGNING_KEY: &[u8] = &[");
-    for (i, byte) in pk_bytes.iter().enumerate() {
-        if i % 16 == 0 {
-            print!("    ");
-        }
-        print!("0x{byte:02x},");
-        if i % 16 == 15 {
-            println!();
-        } else {
-            print!(" ");
-        }
-    }
-    if pk_bytes.len() % 16 != 0 {
-        println!();
-    }
-    println!("];");
-
+    println!("const RELEASE_SIGNING_KEY: &[u8] = &[\n{key_array}];");
     println!("\n--- End of Rust code ---");
+    Ok(())
 }
 
-fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf, context: &str) {
+/// Formats bytes as the body of a Rust byte-array literal, 16 per line.
+fn rust_byte_array(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for row in bytes.chunks(16) {
+        let line: Vec<String> = row.iter().map(|b| format!("0x{b:02x},")).collect();
+        let _ = writeln!(out, "    {}", line.join(" "));
+    }
+    out
+}
+
+fn sign_file(
+    key_path: &Path,
+    input_path: &Path,
+    output_path: &Path,
+    context: &str,
+) -> Result<(), String> {
     println!("Signing {} with ML-DSA-65...", input_path.display());
 
-    // Load secret key
-    let sk_bytes = fs::read(key_path).expect("Failed to read secret key");
-
-    // Parse secret key
+    let sk_bytes = read_file(key_path, "secret key")?;
     let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
-        .expect("Failed to parse secret key");
+        .map_err(|e| format!("failed to parse secret key {}: {e}", key_path.display()))?;
 
-    // Load file to sign
-    let data = fs::read(input_path).expect("Failed to read input file");
+    let data = read_file(input_path, "input file")?;
 
-    // Create DSA instance and sign with context
     let dsa = ml_dsa_65();
     let signature = dsa
         .sign_with_context(&secret_key, &data, context.as_bytes())
-        .expect("Failed to create signature");
+        .map_err(|e| format!("failed to create signature: {e}"))?;
 
     let sig_bytes = signature.to_bytes();
-
-    // Write signature
-    fs::write(output_path, &sig_bytes).expect("Failed to write signature");
+    fs::write(output_path, &sig_bytes)
+        .map_err(|e| format!("failed to write signature {}: {e}", output_path.display()))?;
 
     println!("Signature written to: {}", output_path.display());
     println!("  Signature size: {} bytes", sig_bytes.len());
     println!("  Context: {context}");
+    Ok(())
 }
 
-fn verify_hex_key(hex_input: Option<String>, context: &str) {
-    println!("Validating hex-encoded ML-DSA-65 secret key...\n");
-
-    let hex_str = hex_input.unwrap_or_else(|| {
-        eprintln!("Reading hex from stdin...");
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .expect("Failed to read from stdin");
-        buf
-    });
-
-    // Strip whitespace/newlines that might have been introduced during copy-paste
-    let hex_clean: String = hex_str.chars().filter(char::is_ascii_hexdigit).collect();
-
-    println!("Hex length: {} characters", hex_clean.len());
-    println!("Expected:   {} characters ({} bytes * 2)", 4032 * 2, 4032);
-
-    if hex_clean.len() != 4032 * 2 {
-        eprintln!(
-            "\nERROR: Hex string decodes to {} bytes, expected 4032",
-            hex_clean.len() / 2
-        );
-        process::exit(1);
-    }
-
-    // Decode hex to bytes
-    let bytes: Vec<u8> = (0..hex_clean.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex_clean[i..i + 2], 16).unwrap_or_else(|e| {
-                eprintln!("ERROR: Invalid hex at position {i}: {e}");
-                process::exit(1);
-            })
-        })
+/// Decodes a hex string, ignoring whitespace (line breaks from copy-paste or `echo`).
+/// Any other non-hex character is an error.
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    let digits: Vec<(usize, char)> = input
+        .char_indices()
+        .filter(|(_, c)| !c.is_whitespace())
         .collect();
-
-    println!("Decoded:    {} bytes", bytes.len());
-
-    // Try to parse as ML-DSA-65 secret key
-    match MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &bytes) {
-        Ok(secret_key) => {
-            println!("\nSecret key parsed successfully.");
-
-            // Test-sign something to confirm it's functional
-            let dsa = ml_dsa_65();
-            let test_data = b"ant-keygen-key-validation-test";
-            match dsa.sign_with_context(&secret_key, test_data, context.as_bytes()) {
-                Ok(_) => println!("Test signature created successfully."),
-                Err(e) => {
-                    eprintln!("\nERROR: Key parsed but signing failed: {e}");
-                    process::exit(1);
-                }
-            }
-
-            println!("\nKey is VALID and ready for use.");
-        }
-        Err(e) => {
-            eprintln!("\nERROR: Failed to parse secret key: {e}");
-            process::exit(1);
-        }
+    if let Some((pos, c)) = digits.iter().find(|(_, c)| !c.is_ascii_hexdigit()) {
+        return Err(format!("invalid hex character {c:?} at position {pos}"));
     }
+    if digits.len() % 2 != 0 {
+        return Err(format!(
+            "hex string has an odd number of digits ({})",
+            digits.len()
+        ));
+    }
+    Ok(digits
+        .chunks(2)
+        .map(|pair| {
+            let hi = pair[0].1.to_digit(16).unwrap_or(0);
+            let lo = pair[1].1.to_digit(16).unwrap_or(0);
+            // Both are hex digits (checked above), so this fits in a byte.
+            (hi * 16 + lo) as u8
+        })
+        .collect())
 }
 
-fn verify_signature(key_path: &PathBuf, input_path: &PathBuf, sig_path: &PathBuf, context: &str) {
+fn verify_hex_key(
+    hex_input: Option<String>,
+    public_key_path: &Path,
+    context: &str,
+) -> Result<(), String> {
+    println!("Checking hex-encoded ML-DSA-65 secret key...\n");
+
+    let hex_str = match hex_input {
+        Some(hex) => hex,
+        None => {
+            eprintln!("Reading hex from stdin...");
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| format!("failed to read from stdin: {e}"))?;
+            buf
+        }
+    };
+
+    let bytes = decode_hex(&hex_str)?;
+    if bytes.len() != SECRET_KEY_SIZE {
+        return Err(format!(
+            "hex string decodes to {} bytes, expected {SECRET_KEY_SIZE}",
+            bytes.len()
+        ));
+    }
+    let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &bytes)
+        .map_err(|e| format!("failed to parse secret key: {e}"))?;
+    println!("  Secret key parses ({SECRET_KEY_SIZE} bytes).");
+
+    let public_key = load_public_key(public_key_path)?;
+
+    if !keys_match(&secret_key, &public_key, context)? {
+        return Err(format!(
+            "the secret key does not match the public key {}. A signature made with it \
+             would not verify.",
+            public_key_path.display()
+        ));
+    }
+    println!(
+        "  A test signature with context \"{context}\" verifies against {}.",
+        public_key_path.display()
+    );
+    println!("\nKey is VALID: it matches the expected public key.");
+    Ok(())
+}
+
+fn verify_signature(
+    key_path: &Path,
+    input_path: &Path,
+    sig_path: &Path,
+    context: &str,
+) -> Result<(), String> {
     println!("Verifying signature for {}...", input_path.display());
 
-    // Load public key
-    let pk_bytes = fs::read(key_path).expect("Failed to read public key");
-
-    // Parse public key
-    let public_key = MlDsaPublicKey::from_bytes(MlDsaVariant::MlDsa65, &pk_bytes)
-        .expect("Failed to parse public key");
-
-    // Load file that was signed
-    let data = fs::read(input_path).expect("Failed to read input file");
-
-    // Load signature
-    let sig_bytes = fs::read(sig_path).expect("Failed to read signature");
-
-    // Parse signature
+    let public_key = load_public_key(key_path)?;
+    let data = read_file(input_path, "input file")?;
+    let sig_bytes = read_file(sig_path, "signature")?;
     let signature = MlDsaSignature::from_bytes(MlDsaVariant::MlDsa65, &sig_bytes)
-        .expect("Failed to parse signature");
+        .map_err(|e| format!("failed to parse signature {}: {e}", sig_path.display()))?;
 
-    // Create DSA instance and verify with context
     let dsa = ml_dsa_65();
     match dsa.verify_with_context(&public_key, &data, &signature, context.as_bytes()) {
         Ok(true) => {
             println!("Signature is VALID");
+            Ok(())
         }
-        Ok(false) => {
-            eprintln!("Signature is INVALID");
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Signature verification error: {e}");
-            process::exit(1);
-        }
+        Ok(false) => Err("Signature is INVALID".to_string()),
+        Err(e) => Err(format!("signature verification error: {e}")),
     }
 }

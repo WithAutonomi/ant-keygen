@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking
+
+- **`verify-key` now requires `--public-key <file>`** and checks the secret key against it: it signs
+  a test message and verifies the signature with that public key. Before, it only checked that the
+  key parsed and could sign, so any well-formed ML-DSA-65 key printed "Key is VALID", including the
+  wrong one. Non-hex characters in the input are now an error instead of being silently dropped.
+
+### Fixes
+
+- **`generate`** refuses to overwrite an existing `release-signing-key.secret`,
+  `release-signing-key.pub` or `release_key_embed.rs`, writes the secret key with mode 0600 on
+  Unix, and checks the new pair with a sign/verify round trip before writing it.
+- Malformed keys, signatures or missing files now print an error and exit with code 1 instead of
+  panicking.
+- Unoptimised builds no longer overflow the stack on Windows.
+
+### CI
+
+- New PR workflow: fmt, clippy and the new end-to-end tests (`tests/cli.rs`).
+- Releases check that the tag matches the Cargo.toml version, and pin `cross` to a fixed revision.
+
 ## [0.1.0] - 2026-03-30
 
 Initial release. Extracted from [WithAutonomi/ant-node](https://github.com/WithAutonomi/ant-node)

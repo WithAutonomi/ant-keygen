@@ -23,9 +23,14 @@ ant-keygen generate [output-dir]
 ```
 
 Generates a new ML-DSA-65 keypair and outputs:
-- `release-signing-key.secret` -- secret key (4032 bytes). **Keep this secure.**
+- `release-signing-key.secret` -- secret key (4032 bytes). **Keep this secure.** On Unix it is
+  created readable and writable by the owner only (mode 0600).
 - `release-signing-key.pub` -- public key (1952 bytes)
 - `release_key_embed.rs` -- Rust code for embedding the public key in a binary
+
+It refuses to run if any of these files already exists in the output directory, so an existing
+release key can't be overwritten by accident. The new pair is checked with a test signature
+before anything is written.
 
 ### Sign a file
 
@@ -51,18 +56,22 @@ failure.
 Options:
 - `--context <string>` -- must match the context used during signing (default: `ant-node-release-v1`)
 
-### Validate a hex-encoded key
+### Check a secret key against its public key
 
 ```bash
-ant-keygen verify-key --hex <hex-string>
+ant-keygen verify-key --public-key release-signing-key.pub --hex <hex-string>
 # or pipe from stdin:
-echo "$SECRET_KEY_HEX" | ant-keygen verify-key
+echo "$SECRET_KEY_HEX" | ant-keygen verify-key --public-key release-signing-key.pub
 ```
 
-Validates that a hex-encoded secret key is parseable and functional by performing a test signature.
-Useful for verifying CI secrets are correctly configured.
+Checks that a hex-encoded secret key (for example a CI secret) belongs to the given public key:
+it parses the key, signs a test message and verifies the signature against the public key. A
+well-formed key from a different keypair fails, which is the mistake a CI secret check exists to
+catch. Whitespace and line breaks in the hex are ignored; any other non-hex character is an error.
+Exits with code 0 if the key matches, 1 otherwise.
 
 Options:
+- `--public-key <file>` -- the public key the secret key must belong to (required)
 - `--context <string>` -- signing context for the test signature (default: `ant-node-release-v1`)
 
 ## Signing context
