@@ -108,22 +108,32 @@ enum Commands {
 /// 8 MiB is what Linux gives the main thread.
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Exit code for a panic, as Rust uses for a panicking `main`. Errors exit with 1, so the
+/// two can't be confused (the tests rely on that).
+const PANIC_EXIT_CODE: i32 = 101;
+
 fn main() {
     let cli = Cli::parse();
 
-    let result = std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(move || run(cli.command))
-        .map_err(|e| format!("failed to start the worker thread: {e}"))
-        .and_then(|worker| {
-            worker
-                .join()
-                .unwrap_or_else(|_| Err("the worker thread panicked".to_string()))
-        });
+    {
+        Ok(worker) => worker,
+        Err(e) => {
+            eprintln!("ERROR: failed to start the worker thread: {e}");
+            process::exit(1);
+        }
+    };
 
-    if let Err(e) = result {
-        eprintln!("ERROR: {e}");
-        process::exit(1);
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        // The panic hook has already printed the message.
+        Err(_) => process::exit(PANIC_EXIT_CODE),
     }
 }
 
@@ -203,7 +213,27 @@ fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<(), String
         .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+        .map_err(|e| {
+            // Don't leave a truncated file behind. We created it, so it's ours to remove.
+            drop(file);
+            let _ = fs::remove_file(path);
+            format!("failed to write {}: {e}", path.display())
+        })
+}
+
+/// Writes every `(path, bytes, private)` with [`write_new_file`], all or nothing: if one
+/// fails, the files this call already created are removed again, so a failure never
+/// leaves a partial key set behind.
+fn write_new_files(files: &[(&Path, &[u8], bool)]) -> Result<(), String> {
+    for (done, (path, bytes, private)) in files.iter().enumerate() {
+        if let Err(e) = write_new_file(path, bytes, *private) {
+            for (written, _, _) in &files[..done] {
+                let _ = fs::remove_file(written);
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 fn generate_keypair(output_dir: &Path) -> Result<(), String> {
@@ -248,14 +278,6 @@ fn generate_keypair(output_dir: &Path) -> Result<(), String> {
     println!("  Secret key size: {} bytes", sk_bytes.len());
     println!("  Sign/verify self-check passed.");
 
-    // Save secret key to file (KEEP THIS SECURE!)
-    write_new_file(&sk_path, &sk_bytes, true)?;
-    println!("\nSecret key saved to: {}", sk_path.display());
-    println!("  WARNING: Keep this file secure! It's needed for signing releases.");
-
-    write_new_file(&pk_path, &pk_bytes, false)?;
-    println!("Public key saved to: {}", pk_path.display());
-
     let key_array = rust_byte_array(&pk_bytes);
     let rust_code = format!(
         "/// Embedded release signing public key (ML-DSA-65).\n\
@@ -266,7 +288,16 @@ fn generate_keypair(output_dir: &Path) -> Result<(), String> {
          const RELEASE_SIGNING_KEY: &[u8] = &[\n{key_array}];\n",
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
     );
-    write_new_file(&rust_code_path, rust_code.as_bytes(), false)?;
+
+    // The secret key (KEEP THIS SECURE!), the public key and the embed code, all or nothing.
+    write_new_files(&[
+        (&sk_path, &sk_bytes, true),
+        (&pk_path, &pk_bytes, false),
+        (&rust_code_path, rust_code.as_bytes(), false),
+    ])?;
+    println!("\nSecret key saved to: {}", sk_path.display());
+    println!("  WARNING: Keep this file secure! It's needed for signing releases.");
+    println!("Public key saved to: {}", pk_path.display());
     println!("Rust embed code saved to: {}", rust_code_path.display());
 
     // Also print to stdout for convenience
@@ -410,5 +441,67 @@ fn verify_signature(
         }
         Ok(false) => Err("Signature is INVALID".to_string()),
         Err(e) => Err(format!("signature verification error: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ant-keygen-unit-{}-{name}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_new_files_removes_what_it_wrote_when_a_later_file_fails() {
+        let dir = temp_dir("later-fails");
+        let first = dir.join("first");
+        let second = dir.join("missing-subdir").join("second");
+
+        let result = write_new_files(&[(&first, b"one", true), (&second, b"two", false)]);
+
+        assert!(result.is_err());
+        assert!(!first.exists(), "the first file must be removed again");
+        assert!(!second.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_new_files_never_touches_a_file_it_did_not_create() {
+        let dir = temp_dir("existing");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let existing = dir.join("existing");
+        fs::write(&existing, b"keep me").unwrap();
+
+        let result = write_new_files(&[
+            (&first, b"one", true),
+            (&second, b"two", false),
+            (&existing, b"three", false),
+        ]);
+
+        assert!(result.is_err());
+        assert!(
+            !first.exists() && !second.exists(),
+            "partial set left behind"
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"keep me");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_new_files_writes_every_file() {
+        let dir = temp_dir("all");
+        let first = dir.join("first");
+        let second = dir.join("second");
+
+        write_new_files(&[(&first, b"one", true), (&second, b"two", false)]).unwrap();
+
+        assert_eq!(fs::read(&first).unwrap(), b"one");
+        assert_eq!(fs::read(&second).unwrap(), b"two");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
