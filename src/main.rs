@@ -15,7 +15,8 @@
 //! ant-keygen verify-key --public-key <key.pub> [--hex <hex>]
 //! ```
 //!
-//! Every command exits with code 0 on success and 1 on any failure.
+//! Exit codes: 0 on success, 1 when a command fails, 2 for a command-line usage error
+//! (reported by clap), and 101 if the tool panics.
 
 use clap::{Parser, Subcommand};
 use saorsa_pqc::api::sig::{
@@ -216,19 +217,33 @@ fn write_new_file(path: &Path, bytes: &[u8], private: bool) -> Result<(), String
         .map_err(|e| {
             // Don't leave a truncated file behind. We created it, so it's ours to remove.
             drop(file);
-            let _ = fs::remove_file(path);
-            format!("failed to write {}: {e}", path.display())
+            let mut msg = format!("failed to write {}: {e}", path.display());
+            note_cleanup(&mut msg, path);
+            msg
         })
 }
 
+/// Removes `path`, a file this run created, and appends to `msg` if that fails, so the
+/// error names any partial file left behind instead of silently leaving it there.
+fn note_cleanup(msg: &mut String, path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        let _ = write!(
+            msg,
+            "; also failed to remove the partial file {} ({e}), delete it by hand",
+            path.display()
+        );
+    }
+}
+
 /// Writes every `(path, bytes, private)` with [`write_new_file`], all or nothing: if one
-/// fails, the files this call already created are removed again, so a failure never
-/// leaves a partial key set behind.
+/// fails, the files this call already created are removed again. The cleanup is best
+/// effort (a crash mid-way, or a failed removal, can still leave files behind); a failed
+/// removal is named in the returned error.
 fn write_new_files(files: &[(&Path, &[u8], bool)]) -> Result<(), String> {
     for (done, (path, bytes, private)) in files.iter().enumerate() {
-        if let Err(e) = write_new_file(path, bytes, *private) {
+        if let Err(mut e) = write_new_file(path, bytes, *private) {
             for (written, _, _) in &files[..done] {
-                let _ = fs::remove_file(written);
+                note_cleanup(&mut e, written);
             }
             return Err(e);
         }
@@ -489,6 +504,19 @@ mod tests {
             "partial set left behind"
         );
         assert_eq!(fs::read(&existing).unwrap(), b"keep me");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn note_cleanup_names_a_file_it_could_not_remove() {
+        let dir = temp_dir("cleanup-fails");
+        let gone = dir.join("never-created");
+        let mut msg = String::from("failed to write x");
+
+        note_cleanup(&mut msg, &gone);
+
+        assert!(msg.starts_with("failed to write x; also failed to remove"));
+        assert!(msg.contains(&gone.display().to_string()), "{msg}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
